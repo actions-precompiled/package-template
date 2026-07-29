@@ -1,0 +1,203 @@
+name: Build
+
+# One version per run. Arch matrix inside; optional GitHub Release at the end.
+# Edit package.toml for package identity; this workflow stays generic.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream tag to build (e.g. v1.2.3)'
+        required: true
+        type: string
+      publish:
+        description: 'Create GitHub Release and upload tarballs for this version'
+        required: false
+        type: boolean
+        default: false
+      recreate:
+        description: 'If publish: delete existing release then create fresh'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: package-build-${{ github.event.inputs.version || github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      publish: ${{ steps.plan.outputs.publish }}
+      recreate: ${{ steps.plan.outputs.recreate }}
+      package_name: ${{ steps.plan.outputs.package_name }}
+      image_name: ${{ steps.plan.outputs.image_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PUBLISH: ${{ github.event.inputs.publish }}
+          INPUT_RECREATE: ${{ github.event.inputs.recreate }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 <<'PY'
+          import os, tomllib, importlib.machinery, importlib.util
+          from pathlib import Path
+
+          out = Path(os.environ["GITHUB_OUTPUT"])
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          event = os.environ.get("EVENT_NAME", "")
+          raw = (os.environ.get("INPUT_VERSION") or "").strip()
+          publish = event == "workflow_dispatch" and (os.environ.get("INPUT_PUBLISH") or "").lower() in ("true", "1", "yes")
+          recreate = publish and (os.environ.get("INPUT_RECREATE") or "").lower() in ("true", "1", "yes")
+
+          pkg = tomllib.load(Path("package.toml").open("rb"))["package"]
+          package_name = pkg["name"]
+          image_name = pkg["image_name"]
+          upstream_api = pkg["upstream_repo_api"]
+
+          if raw:
+              version = raw
+          else:
+              path = Path("create_releases").resolve()
+              loader = importlib.machinery.SourceFileLoader("create_releases", str(path))
+              spec = importlib.util.spec_from_loader(loader.name, loader)
+              mod = importlib.util.module_from_spec(spec)
+              loader.exec_module(mod)
+              version = mod.github_api_json(f"/repos/{upstream_api}/releases/latest")["tag_name"]
+
+          with out.open("a", encoding="utf-8") as fh:
+              fh.write(f"version={version}\n")
+              fh.write(f"publish={'true' if publish else 'false'}\n")
+              fh.write(f"recreate={'true' if recreate else 'false'}\n")
+              fh.write(f"package_name={package_name}\n")
+              fh.write(f"image_name={image_name}\n")
+          with summary.open("a", encoding="utf-8") as fh:
+              fh.write(f"## Build plan\n\n- Package: `{package_name}`\n- Version: `{version}`\n- Publish: **{'yes' if publish else 'no'}**\n")
+          print(f"package={package_name} version={version} publish={publish}")
+          PY
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            runner: ubuntu-latest
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (native arch)
+        run: |
+          case "$(uname -m)" in
+            x86_64|amd64) ARCH=amd64 ;;
+            aarch64|arm64) ARCH=arm64 ;;
+            *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+          docker build --build-arg "TARGETARCH=${ARCH}" -t "${{ needs.plan.outputs.image_name }}:local" .
+      - uses: jdx/mise-action@v2
+      - name: Build tarball
+        env:
+          SKIP_IMAGE_BUILD: "1"
+          IMAGE_NAME: ${{ needs.plan.outputs.image_name }}
+          IMAGE_TAG: local
+          TARGETS: ${{ matrix.target }}
+        run: ./create_releases --skip-smoke "${{ needs.plan.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: ${{ needs.plan.outputs.package_name }}-${{ needs.plan.outputs.version }}-${{ matrix.target }}
+          path: target/${{ matrix.target }}/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+      - name: Smoke test
+        if: success()
+        env:
+          TARGETS: ${{ matrix.target }}
+        run: ./create_releases --smoke-only "${{ needs.plan.outputs.version }}"
+      - if: always()
+        run: find target -type f -exec ls -lh {} \; || true
+
+  publish:
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ needs.plan.outputs.package_name }}-${{ needs.plan.outputs.version }}-*
+          merge-multiple: false
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          RECREATE: ${{ needs.plan.outputs.recreate }}
+          PACKAGE_NAME: ${{ needs.plan.outputs.package_name }}
+        run: |
+          python3 <<'PY'
+          import os, subprocess, sys, tomllib
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          package_name = os.environ["PACKAGE_NAME"]
+          recreate = (os.environ.get("RECREATE") or "").lower() in ("true", "1", "yes")
+          bare = version[1:] if version.startswith("v") else version
+          root = Path("artifacts")
+          matched = sorted(
+              p for p in root.rglob("*.tar.gz")
+              if bare in p.name or version in p.name
+          )
+          if not matched:
+              print("No tarballs", file=sys.stderr)
+              sys.exit(1)
+          names = {p.name for p in matched}
+          need = {
+              f"{package_name}-{bare}-linux-amd64.tar.gz",
+              f"{package_name}-{bare}-linux-aarch64.tar.gz",
+          }
+          missing = sorted(need - names)
+          if missing:
+              print("Incomplete:", missing, file=sys.stderr)
+              sys.exit(1)
+          pkg = tomllib.load(Path("package.toml").open("rb"))["package"]
+          notes = f"""{pkg.get("description", package_name)}
+
+          Install: extract the tarball and put `bin/` on your PATH.
+
+          Assets:
+          {chr(10).join(f'- `{p.name}`' for p in sorted(matched))}
+
+          Upstream: {pkg.get("homepage", "")}
+          """
+          if recreate:
+              subprocess.run(["gh", "release", "delete", version, "--yes", "--cleanup-tag"], check=False)
+          create = subprocess.run(
+              ["gh", "release", "create", version, "--title", f"{package_name} {version}",
+               "--notes", notes, "--latest=false"],
+              check=False,
+          )
+          if create.returncode != 0 and recreate:
+              sys.exit(create.returncode or 1)
+          for t in sorted(matched):
+              subprocess.run(["gh", "release", "upload", version, "--clobber", str(t)], check=True)
+          print("OK", version)
+          PY

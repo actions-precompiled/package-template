@@ -1,0 +1,27 @@
+# Copy this repo as a GitHub template, then edit this file and the marked spots
+# in Dockerfile / scripts/build_and_package.sh.
+
+[package]
+# Short name used for artifacts, image, and release titles: example-1.2.3-linux-amd64.tar.gz
+name = "example"
+
+# GitHub "owner/repo" used to list upstream tags/releases
+upstream_repo_api = "example-org/example"
+
+# Git URL cloned inside the build container (can match upstream_repo_api)
+upstream_git = "https://github.com/example-org/example.git"
+
+# Docker image name built by CI / create_releases
+image_name = "example-buildenv"
+
+# Binary name expected under bin/ for smoke tests
+binary = "example"
+
+# Env var name passed into the container (scripts/build_and_package.sh reads it)
+version_env = "EXAMPLE_VERSION"
+
+# Optional: description for release notes
+description = "Prebuilt example package (relocatable tree)."
+
+# Homepage / upstream URL for release notes
+homepage = "https://github.com/example-org/example"
